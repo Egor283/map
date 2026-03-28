@@ -1,0 +1,464 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, TransformStamped
+from tf2_ros import TransformBroadcaster
+import math
+import random
+
+
+class SlamWorldSimulator(Node):
+    """
+    Симулятор квартиры с лидаром и одометрией для тестирования SLAM.
+    """
+    
+    def __init__(self):
+        super().__init__('slam_world_simulator')
+        
+        # ═══════════════════════════════════════════════════
+        # ПАРАМЕТРЫ ЛИДАРА D500
+        # ═══════════════════════════════════════════════════
+        self.angle_min = 0.0
+        self.angle_max = 2 * math.pi
+        self.angle_increment = math.radians(0.5)
+        self.num_readings = 720
+        self.range_min = 0.1
+        self.range_max = 12.0
+        self.noise_std = 0.02
+        
+        # ═══════════════════════════════════════════════════
+        # ПОЗИЦИЯ РОБОТА
+        # ═══════════════════════════════════════════════════
+        self.robot_x = 2.0
+        self.robot_y = 2.0
+        self.robot_theta = 0.0
+        self.robot_vx = 0.0
+        self.robot_vtheta = 0.0
+        
+        # ═══════════════════════════════════════════════════
+        # ГЕОМЕТРИЯ КВАРТИРЫ С ДВЕРНЫМИ ПРОЁМАМИ
+        # ═══════════════════════════════════════════════════
+        
+        # Внешние стены (квартира 12×10 метров)
+        self.walls = [
+            # Внешний периметр
+            (0.0, 0.0, 12.0, 0.0),    # Нижняя стена
+            (12.0, 0.0, 12.0, 10.0),  # Правая стена
+            (12.0, 10.0, 0.0, 10.0),  # Верхняя стена
+            (0.0, 10.0, 0.0, 0.0),    # Левая стена
+            
+            # ДВЕРНЫЕ ПРОЁМЫ (ширина 0.8 м)
+            # Дверь между гостиной и коридором (на стене x=6.0, y от 3.6 до 4.4)
+            # Вместо цельной стены делаем два отрезка с проёмом
+            (6.0, 0.0, 6.0, 3.6),     # Нижняя часть стены до двери
+            (6.0, 4.4, 6.0, 10.0),    # Верхняя часть стены после двери
+            
+            # Дверь между кухней и коридором (на стене y=6.0, x от 4.4 до 5.2)
+            (0.0, 6.0, 4.4, 6.0),     # Левая часть стены до двери
+            (5.2, 6.0, 12.0, 6.0),    # Правая часть стены после двери
+            
+            # Дверь в спальню (на стене x=6.0, y от 5.6 до 6.4)
+            # Уже разделено выше
+            
+            # Внутренние перегородки
+            # Стена между гостиной и спальней (с дверным проёмом)
+            (4.5, 4.0, 4.5, 5.6),     # Часть стены до двери
+            (4.5, 6.4, 4.5, 10.0),    # Часть стены после двери
+        ]
+        
+        # Мебель и препятствия (круги и прямоугольники)
+        self.obstacles = [
+            # ===== ГОСТИНАЯ =====
+            # Диван (большой угловой)
+            {'type': 'rect', 'x': 0.5, 'y': 0.5, 'w': 2.5, 'h': 1.0, 'name': 'диван'},
+            
+            # Журнальный стол
+            {'type': 'circle', 'x': 2.5, 'y': 2.0, 'r': 0.5, 'name': 'журнальный_стол'},
+            
+            # Кресло
+            {'type': 'circle', 'x': 3.2, 'y': 1.2, 'r': 0.45, 'name': 'кресло'},
+            
+            # Торшер
+            {'type': 'circle', 'x': 1.8, 'y': 1.5, 'r': 0.2, 'name': 'торшер'},
+            
+            # Телевизор с тумбой
+            {'type': 'rect', 'x': 3.5, 'y': 2.8, 'w': 1.2, 'h': 0.4, 'name': 'телевизор'},
+            
+            # ===== КУХНЯ =====
+            # Кухонный гарнитур
+            {'type': 'rect', 'x': 0.2, 'y': 7.0, 'w': 3.0, 'h': 0.6, 'name': 'кухонный_гарнитур'},
+            
+            # Обеденный стол
+            {'type': 'rect', 'x': 2.5, 'y': 8.0, 'w': 1.2, 'h': 0.8, 'name': 'обеденный_стол'},
+            
+            # Стулья вокруг стола (4 штуки)
+            {'type': 'circle', 'x': 2.0, 'y': 7.8, 'r': 0.3, 'name': 'стул_1'},
+            {'type': 'circle', 'x': 3.0, 'y': 7.8, 'r': 0.3, 'name': 'стул_2'},
+            {'type': 'circle', 'x': 2.5, 'y': 7.3, 'r': 0.3, 'name': 'стул_3'},
+            {'type': 'circle', 'x': 2.5, 'y': 8.5, 'r': 0.3, 'name': 'стул_4'},
+            
+            # Холодильник
+            {'type': 'rect', 'x': 0.1, 'y': 9.0, 'w': 0.8, 'h': 0.8, 'name': 'холодильник'},
+            
+            # ===== СПАЛЬНЯ =====
+            # Кровать
+            {'type': 'rect', 'x': 7.5, 'y': 1.0, 'w': 2.2, 'h': 1.8, 'name': 'кровать'},
+            
+            # Прикроватные тумбочки
+            {'type': 'rect', 'x': 7.2, 'y': 0.8, 'w': 0.5, 'h': 0.5, 'name': 'тумбочка_левая'},
+            {'type': 'rect', 'x': 9.5, 'y': 0.8, 'w': 0.5, 'h': 0.5, 'name': 'тумбочка_правая'},
+            
+            # Шкаф
+            {'type': 'rect', 'x': 9.0, 'y': 2.0, 'w': 1.2, 'h': 2.0, 'name': 'шкаф'},
+            
+            # Комод
+            {'type': 'rect', 'x': 8.0, 'y': 3.5, 'w': 1.0, 'h': 0.6, 'name': 'комод'},
+            
+            # ===== КОРИДОР =====
+            # Прихожая (вешалка)
+            {'type': 'rect', 'x': 10.5, 'y': 5.5, 'w': 0.8, 'h': 0.8, 'name': 'вешалка'},
+            
+            # Зеркало в коридоре
+            {'type': 'rect', 'x': 9.5, 'y': 5.0, 'w': 0.1, 'h': 1.0, 'name': 'зеркало'},
+            
+            # ===== ВАННАЯ КОМНАТА =====
+            # Унитаз
+            {'type': 'circle', 'x': 11.0, 'y': 8.5, 'r': 0.4, 'name': 'унитаз'},
+            
+            # Раковина
+            {'type': 'circle', 'x': 11.0, 'y': 7.5, 'r': 0.35, 'name': 'раковина'},
+            
+            # Ванна
+            {'type': 'rect', 'x': 9.5, 'y': 7.0, 'w': 1.5, 'h': 0.8, 'name': 'ванна'},
+            
+            # Стиральная машина
+            {'type': 'rect', 'x': 8.5, 'y': 8.5, 'w': 0.7, 'h': 0.7, 'name': 'стиралка'},
+        ]
+        
+        # ═══════════════════════════════════════════════════
+        # ROS 2 ИНТЕРФЕЙСЫ
+        # ═══════════════════════════════════════════════════
+        
+        # Publishers
+        self.scan_pub = self.create_publisher(LaserScan, '/scan', 10)
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        
+        # Subscriber для управления
+        self.cmd_sub = self.create_subscription(
+            Twist, '/cmd_vel', self.cmd_callback, 10)
+        
+        # TF broadcaster
+        self.tf_broadcaster = TransformBroadcaster(self)
+        
+        # Таймеры
+        self.scan_timer = self.create_timer(0.1, self.publish_scan)    # 10 Hz
+        self.odom_timer = self.create_timer(0.02, self.update_odom)    # 50 Hz
+        
+        self.last_time = self.get_clock().now()
+        
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('SLAM World Simulator started (Enhanced Version)')
+        self.get_logger().info('Apartment size: 12×10 meters')
+        self.get_logger().info(f'Robot start position: ({self.robot_x}, {self.robot_y})')
+        self.get_logger().info('')
+        self.get_logger().info('Features added:')
+        self.get_logger().info('  ✓ 3 door openings (0.8m width each)')
+        self.get_logger().info('  ✓ 20+ furniture items')
+        self.get_logger().info('  ✓ Realistic room layout')
+        self.get_logger().info('')
+        self.get_logger().info('Door locations:')
+        self.get_logger().info('  → Living room to corridor (x=6.0, y=3.6-4.4)')
+        self.get_logger().info('  → Kitchen to corridor (y=6.0, x=4.4-5.2)')
+        self.get_logger().info('  → Living room to bedroom (x=4.5, y=5.6-6.4)')
+        self.get_logger().info('=' * 60)
+    
+    def cmd_callback(self, msg):
+        """Обработка команд управления."""
+        self.robot_vx = msg.linear.x
+        self.robot_vtheta = msg.angular.z
+    
+    def update_odom(self):
+        """Обновление позиции робота и публикация одометрии."""
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds / 1e9
+        self.last_time = current_time
+        
+        # Сохраняем старую позицию для проверки коллизий
+        old_x, old_y = self.robot_x, self.robot_y
+        
+        # Обновляем позицию
+        if abs(self.robot_vtheta) < 0.001:
+            # Движение по прямой
+            self.robot_x += self.robot_vx * math.cos(self.robot_theta) * dt
+            self.robot_y += self.robot_vx * math.sin(self.robot_theta) * dt
+        else:
+            # Движение по дуге
+            radius = self.robot_vx / self.robot_vtheta
+            self.robot_x += radius * (math.sin(self.robot_theta + self.robot_vtheta * dt) - 
+                                      math.sin(self.robot_theta))
+            self.robot_y += radius * (math.cos(self.robot_theta) - 
+                                      math.cos(self.robot_theta + self.robot_vtheta * dt))
+        
+        self.robot_theta += self.robot_vtheta * dt
+        
+        # Нормализация угла
+        while self.robot_theta > math.pi:
+            self.robot_theta -= 2 * math.pi
+        while self.robot_theta < -math.pi:
+            self.robot_theta += 2 * math.pi
+        
+        # Проверка столкновений со стенами и мебелью
+        if self.check_collision(self.robot_x, self.robot_y):
+            # Откатываем движение
+            self.robot_x, self.robot_y = old_x, old_y
+            self.robot_vx = 0.0
+            self.robot_vtheta = 0.0
+        
+        # Публикация одометрии
+        odom = Odometry()
+        odom.header.stamp = current_time.to_msg()
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'base_link'
+        
+        odom.pose.pose.position.x = self.robot_x
+        odom.pose.pose.position.y = self.robot_y
+        odom.pose.pose.position.z = 0.0
+        
+        # Кватернион из угла
+        odom.pose.pose.orientation.z = math.sin(self.robot_theta / 2)
+        odom.pose.pose.orientation.w = math.cos(self.robot_theta / 2)
+        
+        odom.twist.twist.linear.x = self.robot_vx
+        odom.twist.twist.angular.z = self.robot_vtheta
+        
+        self.odom_pub.publish(odom)
+        
+        # TF: odom → base_link
+        t = TransformStamped()
+        t.header.stamp = current_time.to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_link'
+        t.transform.translation.x = self.robot_x
+        t.transform.translation.y = self.robot_y
+        t.transform.translation.z = 0.0
+        t.transform.rotation.z = math.sin(self.robot_theta / 2)
+        t.transform.rotation.w = math.cos(self.robot_theta / 2)
+        
+        self.tf_broadcaster.sendTransform(t)
+        
+        # TF: base_link → laser_link (лидар в центре)
+        t_laser = TransformStamped()
+        t_laser.header.stamp = current_time.to_msg()
+        t_laser.header.frame_id = 'base_link'
+        t_laser.child_frame_id = 'laser_link'
+        t_laser.transform.translation.z = 0.1
+        t_laser.transform.rotation.w = 1.0
+        
+        self.tf_broadcaster.sendTransform(t_laser)
+    
+    def check_collision(self, x, y, radius=0.2):
+        """Проверка столкновения робота со стенами и препятствиями."""
+        # Проверка стен
+        for wall in self.walls:
+            if self.point_to_segment_distance(x, y, wall[0], wall[1], wall[2], wall[3]) < radius:
+                return True
+        
+        # Проверка препятствий
+        for obs in self.obstacles:
+            if obs['type'] == 'circle':
+                dist = math.sqrt((x - obs['x'])**2 + (y - obs['y'])**2)
+                if dist < radius + obs['r']:
+                    return True
+            elif obs['type'] == 'rect':
+                # Проверка прямоугольника с учетом радиуса робота
+                closest_x = max(obs['x'], min(x, obs['x'] + obs['w']))
+                closest_y = max(obs['y'], min(y, obs['y'] + obs['h']))
+                dist = math.sqrt((x - closest_x)**2 + (y - closest_y)**2)
+                if dist < radius:
+                    return True
+        
+        return False
+    
+    def point_to_segment_distance(self, px, py, x1, y1, x2, y2):
+        """Расстояние от точки до отрезка."""
+        # Вектор отрезка
+        ax = x2 - x1
+        ay = y2 - y1
+        
+        # Проекция точки на отрезок
+        t = ((px - x1) * ax + (py - y1) * ay) / (ax * ax + ay * ay + 1e-10)
+        t = max(0.0, min(1.0, t))
+        
+        # Ближайшая точка на отрезке
+        nearest_x = x1 + t * ax
+        nearest_y = y1 + t * ay
+        
+        return math.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
+    
+    def publish_scan(self):
+        """Генерация и публикация лидарного скана."""
+        ranges = []
+        
+        for i in range(self.num_readings):
+            angle = self.angle_min + i * self.angle_increment
+            world_angle = self.robot_theta + angle
+            
+            min_dist = self.range_max
+            
+            # Проверяем пересечение со стенами
+            for wall in self.walls:
+                dist = self.ray_line_intersection(
+                    self.robot_x, self.robot_y,
+                    world_angle,
+                    wall[0], wall[1], wall[2], wall[3]
+                )
+                if dist is not None and dist < min_dist:
+                    min_dist = dist
+            
+            # Проверяем пересечение с препятствиями
+            for obs in self.obstacles:
+                if obs['type'] == 'circle':
+                    dist = self.ray_circle_intersection(
+                        self.robot_x, self.robot_y,
+                        world_angle,
+                        obs['x'], obs['y'], obs['r']
+                    )
+                elif obs['type'] == 'rect':
+                    dist = self.ray_rect_intersection(
+                        self.robot_x, self.robot_y,
+                        world_angle,
+                        obs['x'], obs['y'], obs['w'], obs['h']
+                    )
+                
+                if dist is not None and dist < min_dist:
+                    min_dist = dist
+            
+            # Добавляем шум
+            if min_dist < self.range_max:
+                min_dist += random.gauss(0, self.noise_std)
+                min_dist = max(self.range_min, min(self.range_max, min_dist))
+            
+            # Случайные пропуски (2%)
+            if random.random() < 0.02:
+                min_dist = float('inf')
+            
+            ranges.append(min_dist)
+        
+        # Публикуем скан
+        scan = LaserScan()
+        scan.header.stamp = self.get_clock().now().to_msg()
+        scan.header.frame_id = 'laser_link'
+        scan.angle_min = self.angle_min
+        scan.angle_max = self.angle_max
+        scan.angle_increment = self.angle_increment
+        scan.time_increment = 0.0
+        scan.scan_time = 0.1
+        scan.range_min = self.range_min
+        scan.range_max = self.range_max
+        scan.ranges = ranges
+        
+        self.scan_pub.publish(scan)
+    
+    def ray_line_intersection(self, rx, ry, angle, x1, y1, x2, y2):
+        """Пересечение луча с отрезком."""
+        dx = math.cos(angle)
+        dy = math.sin(angle)
+        
+        x3, y3 = rx, ry
+        x4, y4 = rx + dx * 100, ry + dy * 100
+        
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-10:
+            return None
+        
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+        
+        if 0 <= t <= 1 and u > 0:
+            ix = x1 + t * (x2 - x1)
+            iy = y1 + t * (y2 - y1)
+            return math.sqrt((ix - rx)**2 + (iy - ry)**2)
+        
+        return None
+    
+    def ray_circle_intersection(self, rx, ry, angle, cx, cy, radius):
+        """Пересечение луча с кругом."""
+        dx = math.cos(angle)
+        dy = math.sin(angle)
+        
+        fx = rx - cx
+        fy = ry - cy
+        
+        a = dx * dx + dy * dy
+        b = 2 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - radius * radius
+        
+        discriminant = b * b - 4 * a * c
+        
+        if discriminant < 0:
+            return None
+        
+        discriminant = math.sqrt(discriminant)
+        t1 = (-b - discriminant) / (2 * a)
+        t2 = (-b + discriminant) / (2 * a)
+        
+        if t1 > 0:
+            return t1
+        if t2 > 0:
+            return t2
+        
+        return None
+    
+    def ray_rect_intersection(self, rx, ry, angle, ox, oy, w, h):
+        """Пересечение луча с прямоугольником."""
+        # Прямоугольник как 4 отрезка
+        edges = [
+            (ox, oy, ox + w, oy),         # Нижняя
+            (ox + w, oy, ox + w, oy + h), # Правая
+            (ox + w, oy + h, ox, oy + h), # Верхняя
+            (ox, oy + h, ox, oy),         # Левая
+        ]
+        
+        min_dist = None
+        for edge in edges:
+            dist = self.ray_line_intersection(rx, ry, angle, *edge)
+            if dist is not None:
+                if min_dist is None or dist < min_dist:
+                    min_dist = dist
+        
+        return min_dist
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SlamWorldSimulator()
+    
+    # Выводим информацию о карте для проверки
+    node.get_logger().info('\n' + '='*60)
+    node.get_logger().info('MAP CONFIGURATION SUMMARY:')
+    node.get_logger().info(f'  • Total walls: {len(node.walls)} (including door openings)')
+    node.get_logger().info(f'  • Total obstacles: {len(node.obstacles)}')
+    node.get_logger().info('')
+    node.get_logger().info('DOOR OPENINGS (0.8m width each):')
+    node.get_logger().info('  1. Living room ↔ Corridor (x=6.0, y=3.6-4.4)')
+    node.get_logger().info('  2. Kitchen ↔ Corridor (y=6.0, x=4.4-5.2)')
+    node.get_logger().info('  3. Living room ↔ Bedroom (x=4.5, y=5.6-6.4)')
+    node.get_logger().info('')
+    node.get_logger().info('FURNITURE ADDED:')
+    furniture_names = [obs.get('name', 'unnamed') for obs in node.obstacles]
+    for i, name in enumerate(furniture_names, 1):
+        node.get_logger().info(f'  {i}. {name}')
+    node.get_logger().info('='*60)
+    node.get_logger().info('')
+    node.get_logger().info('✓ Ready for SLAM testing!')
+    node.get_logger().info('  Drive the robot through door openings to verify map building')
+    node.get_logger().info('  Door openings should appear as clear passages in the map')
+    node.get_logger().info('')
+    
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
